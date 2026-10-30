@@ -49,7 +49,6 @@ if st.button("   번역하기  "):
             )
 
             # 결과 출력
-            translated_text = response.choices[0].message.content
-
+            translated_text = response.output_text
             st.subheader("  번역    ")
             st.success(    translated_text )
