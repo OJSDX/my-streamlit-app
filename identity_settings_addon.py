@@ -5,6 +5,10 @@
 import copy
 import json
 import re
+import os
+import urllib.request
+import urllib.parse
+import urllib.error
 from collections import defaultdict
 
 import streamlit as st
@@ -27,6 +31,153 @@ LEFT = r"(?<![가-힣A-Za-z0-9])"
 RIGHT = r"(?=(?:께서는|께서|에게|한테|으로|로|은|는|이|가|을|를|과|와|의|도|만)?(?:[^가-힣A-Za-z0-9]|$))"
 
 
+
+# ================================================================
+# 영구 저장소(Supabase PostgreSQL / REST API)
+# - Secret Key는 Streamlit Cloud 서버의 Secrets에서만 읽는다.
+# - 사용자 인증이 없는 현재 앱은 지정된 PROFILE_ID 하나를 팀에서 공유한다.
+# - 설정 / 승인된 인물 / 승인 대기 후보만 저장한다. 녹음 전문은 저장하지 않는다.
+# ================================================================
+PERSISTED_SETTINGS = (
+    "identity_enabled", "identity_context_enabled",
+    "identity_auto_discovery_enabled",
+)
+
+
+def _identity_db_config():
+    def config_value(name):
+        value = os.environ.get(name)
+        if value:
+            return value
+        try:
+            return st.secrets.get(name, "")
+        except (FileNotFoundError, KeyError):
+            return ""
+
+    url = str(config_value("SUPABASE_URL")).strip().rstrip("/")
+    key = str(config_value("SUPABASE_SECRET_KEY") or config_value("SUPABASE_SERVICE_ROLE_KEY")).strip()
+    profile = str(config_value("IDENTITY_PROFILE_ID") or "thumbsup-team").strip()
+    if not url or not key:
+        return None
+    if not url.startswith("https://") or not profile or len(profile) > 100:
+        raise ValueError("Supabase URL 또는 프로필 ID 설정을 확인하세요.")
+    return url, key, profile
+
+
+def _identity_db_request(method, *, payload=None):
+    config = _identity_db_config()
+    if not config:
+        raise RuntimeError("Supabase Secrets 미설정")
+    url, key, profile = config
+    route = url + "/rest/v1/identity_app_state"
+    if method == "GET":
+        route += "?profile_id=eq." + urllib.parse.quote(profile, safe="") + "&select=state"
+    elif method == "POST":
+        route += "?on_conflict=profile_id"
+    headers = {
+        "apikey": key,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    # 기존 JWT형 service_role 키를 사용하는 프로젝트를 위한 호환 처리.
+    if key.startswith("eyJ"):
+        headers["Authorization"] = "Bearer " + key
+    if method == "POST":
+        headers["Prefer"] = "resolution=merge-duplicates,return=minimal"
+    data = None if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(route, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=8) as res:
+            body = res.read(250_000)
+            return json.loads(body) if body else None
+    except urllib.error.HTTPError as exc:
+        # 인증 정보나 응답 본문을 사용자 화면에 출력하지 않는다.
+        raise RuntimeError(f"Supabase HTTP {exc.code} (테이블·Secrets·접근 권한 확인)") from None
+    except (urllib.error.URLError, TimeoutError) as exc:
+        raise RuntimeError(f"Supabase 연결 실패: {type(exc).__name__}") from None
+
+
+def _sanitize_pending(data):
+    if not isinstance(data, list):
+        return []
+    clean = []
+    for candidate in data[:30]:
+        if not isinstance(candidate, dict):
+            continue
+        name, title, evidence = (candidate.get(k, "") for k in ("name", "title", "evidence"))
+        aliases = candidate.get("extra_aliases", [])
+        if not (isinstance(name, str) and 2 <= len(name.strip()) <= 60
+                and isinstance(title, str) and len(title) <= 40
+                and isinstance(evidence, str) and len(evidence) <= 180
+                and isinstance(aliases, list)):
+            continue
+        clean.append({
+            "name": name.strip(), "title": title.strip(),
+            "evidence": evidence, "extra_aliases": [a.strip() for a in aliases[:30]
+                if isinstance(a, str) and 0 < len(a.strip()) <= 60]
+        })
+    return clean
+
+
+def save_identity_state():
+    """사용자가 변경한 설정을 DB에 upsert. 실패해도 대화 기능은 유지한다."""
+    if not _identity_db_config():
+        st.session_state.identity_storage_status = "⚠️ 영구 저장 미연결: 현재 세션에만 저장됩니다."
+        return False
+    try:
+        state = {
+            "settings": {key: bool(st.session_state.get(key, False)) for key in PERSISTED_SETTINGS},
+            "people": validate_people(st.session_state.identity_people),
+            "pending": _sanitize_pending(st.session_state.identity_pending),
+        }
+        profile = _identity_db_config()[2]
+        _identity_db_request("POST", payload={"profile_id": profile, "state": state})
+        st.session_state.identity_storage_status = "✅ Supabase 저장 완료"
+        return True
+    except Exception as exc:
+        st.session_state.identity_storage_status = f"❌ 영구 저장 실패: {type(exc).__name__}" + (
+            f" ({str(exc)})" if isinstance(exc, RuntimeError) else ""
+        )
+        return False
+
+
+def load_identity_state():
+    """세션 최초 시작 시 1회 불러오기; 중간 실패 시 기본값을 DB에 덮어쓰지 않는다."""
+    if not _identity_db_config():
+        st.session_state.identity_storage_status = "⚠️ Supabase 미설정: 현재 세션에만 유지됩니다."
+        return
+    try:
+        rows = _identity_db_request("GET")
+        if not rows:
+            st.session_state.identity_storage_status = "☁️ DB 연결됨 · 아직 저장된 설정 없음"
+            return
+        if not isinstance(rows, list) or not isinstance(rows[0], dict):
+            raise ValueError("DB 응답 형식 오류")
+        state = rows[0].get("state")
+        if not isinstance(state, dict):
+            raise ValueError("DB 상태 데이터 형식 오류")
+        people = validate_people(state.get("people", {}))
+        pending = _sanitize_pending(state.get("pending", []))
+        settings = state.get("settings", {})
+        if not isinstance(settings, dict):
+            raise ValueError("DB 설정 데이터 형식 오류")
+        for key in PERSISTED_SETTINGS:
+            if key in settings:
+                if not isinstance(settings[key], bool):
+                    raise ValueError(f"{key}: boolean 형식 오류")
+        st.session_state.identity_people = people
+        st.session_state.identity_pending = pending
+        for key in PERSISTED_SETTINGS:
+            if key in settings:
+                st.session_state[key] = settings[key]
+        st.session_state.identity_storage_status = "✅ Supabase 설정 불러오기 완료"
+    except Exception as exc:
+        st.session_state.identity_storage_status = (
+            f"❌ 영구 저장 불러오기 실패: {type(exc).__name__}" +
+            (f" ({str(exc)})" if isinstance(exc, RuntimeError) else "")
+        )
+
+
 def init_identity():
     defaults = {
         "identity_people": copy.deepcopy(DEFAULT_PEOPLE),
@@ -36,10 +187,16 @@ def init_identity():
         "identity_auto_discovery_enabled": True,
         "identity_pending": [],
         "identity_discovery_error": None,
+        "identity_discovery_status": "아직 신규 녹음을 분석하지 않았습니다.",
+        "identity_last_transcript": "",
     }
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
+    if not st.session_state.get("_identity_db_loaded", False):
+        # 실패해도 매 리런마다 DB로 기본값을 덮어쓰지 않는다.
+        st.session_state["_identity_db_loaded"] = True
+        load_identity_state()
 
 
 def validate_people(data):
@@ -327,29 +484,44 @@ def extract_new_people(client, transcript, existing_people):
 
 
 def propose_new_people(client, transcript):
-    """새 녹음이 들어올 때 호출: 후보만 보관하고 인물 목록은 변경하지 않는다."""
+    """새 녹음에서 신규 인물 후보를 추출하고 상태를 기록한다."""
     init_identity()
-    if not (st.session_state.identity_enabled
-            and st.session_state.identity_auto_discovery_enabled):
+    st.session_state.identity_last_transcript = transcript
+
+    if not st.session_state.identity_enabled:
+        st.session_state.identity_discovery_status = "인물 구분 기능이 꺼져 있어 분석하지 않았습니다."
+        st.session_state.identity_discovery_error = None
         return []
+    if not st.session_state.identity_auto_discovery_enabled:
+        st.session_state.identity_discovery_status = "신규 인물 자동 추출 기능이 꺼져 있습니다."
+        st.session_state.identity_discovery_error = None
+        return []
+    st.session_state.identity_discovery_status = "신규 인물 추출 진행 중"
     st.session_state.identity_discovery_error = None
     try:
-        proposed = extract_new_people(
-            client, transcript, st.session_state.identity_people
-        )
+        proposed = extract_new_people(client, transcript, st.session_state.identity_people)
     except Exception as exc:
-        # API 장애가 STT/기존 인물 식별/AI 답변을 방해해서는 안 됨.
-        st.session_state.identity_discovery_error = str(exc)[:200]
+        # API 오류가 STT 및 일반 답변 기능까지 중단시키지 않도록 격리.
+        # API 토큰·전문 등이 포함될 수 있어 예외 본문은 화면에 노출하지 않는다.
+        st.session_state.identity_discovery_status = "신규 인물 추출 실패"
+        st.session_state.identity_discovery_error = type(exc).__name__
         return []
 
-    pending = st.session_state.identity_pending
+    pending = list(st.session_state.identity_pending)
     existing_names = {p["name"] for p in st.session_state.identity_people.values()}
     pending_names = {p["name"] for p in pending}
+    added = 0
     for person in proposed:
         if person["name"] not in existing_names and person["name"] not in pending_names:
             pending.append(person)
             pending_names.add(person["name"])
+            added += 1
     st.session_state.identity_pending = pending[:30]
+    if added:
+        save_identity_state()
+    st.session_state.identity_discovery_status = (
+        f"분석 완료: {len(proposed)}명 추출, {added}명 신규 후보 추가"
+    )
     return proposed
 
 
@@ -382,11 +554,20 @@ def approve_pending_person(index, *, name, title, aliases):
     st.session_state.identity_pending = [
         p for i, p in enumerate(pending) if i != index
     ]
+    save_identity_state()
     return pid
 
 
 def render_new_people_review():
     """새 인물 후보별 승인/거부 UI. 승인된 경우만 세션 인물 목록에 반영."""
+    st.markdown("#### 🔍 신규 인물 추출 상태")
+    st.write("상태:", st.session_state.identity_discovery_status)
+    st.write("검토 대기:", len(st.session_state.identity_pending), "명")
+    with st.expander("최근 분석한 STT 텍스트"):
+        st.write(st.session_state.identity_last_transcript or "아직 분석된 녹음이 없습니다.")
+    if st.session_state.identity_discovery_error:
+        st.error("신규 인물 추출 오류 유형: " + st.session_state.identity_discovery_error)
+
     pending = st.session_state.identity_pending
     if st.session_state.identity_discovery_error:
         st.warning("신규 인물 자동 추출을 완료하지 못했습니다. "
@@ -422,22 +603,55 @@ def render_new_people_review():
                 st.session_state.identity_pending = [
                     p for i, p in enumerate(st.session_state.identity_pending) if i != index
                 ]
+                save_identity_state()
                 st.rerun()
+
+
+# 체크박스는 팝업을 닫으면 Streamlit이 위젯 키를 정리할 수 있으므로,
+# 영구적인 세션 설정 키(identity_*)와 표시용 위젯 키(_identity_widget_*)를 분리한다.
+def _sync_identity_setting(setting_key, widget_key):
+    st.session_state[setting_key] = bool(st.session_state[widget_key])
+    save_identity_state()
+
+
+def _persistent_identity_checkbox(label, setting_key, *, disabled=False):
+    widget_key = "_identity_widget_" + setting_key
+    # 팝업을 다시 열 때는 반드시 실제 설정값으로 위젯을 초기화한다.
+    st.session_state[widget_key] = bool(st.session_state[setting_key])
+    st.checkbox(
+        label,
+        key=widget_key,
+        disabled=disabled,
+        on_change=_sync_identity_setting,
+        args=(setting_key, widget_key),
+    )
 
 
 def render_identity_settings():
     """설정 내용만 렌더링: 미래의 UI 설정 페이지에서도 재사용 가능."""
     init_identity()
     st.subheader("👥 인물 식별 설정")
-    st.checkbox("인물 구분 기능 사용", key="identity_enabled")
-    st.checkbox("LLM 문맥 기반 식별 사용", key="identity_context_enabled",
-                disabled=not st.session_state.identity_enabled)
+    _persistent_identity_checkbox("인물 구분 기능 사용", "identity_enabled")
+    _persistent_identity_checkbox(
+        "LLM 문맥 기반 식별 사용", "identity_context_enabled",
+        disabled=not st.session_state.identity_enabled,
+    )
     st.caption("등록된 이름·직급·별명으로 먼저 매칭하고, 미등록 호칭은 문맥으로 추론합니다.")
 
-    st.checkbox("새 녹음에서 신규 인물 후보 자동 추출", key="identity_auto_discovery_enabled",
-                disabled=not st.session_state.identity_enabled)
+    _persistent_identity_checkbox(
+        "새 녹음에서 신규 인물 후보 자동 추출", "identity_auto_discovery_enabled",
+        disabled=not st.session_state.identity_enabled,
+    )
     st.caption("새 사람을 자동 저장하지 않습니다. 이름이 명확히 언급된 경우 후보로 올리고 승인 후 등록합니다. "
                "음성에서 화자의 목소리를 판별하는 기능은 아닙니다.")
+    st.caption("설정값·등록 인물·승인 대기 후보는 Supabase 연결 시 영구 저장됩니다. "
+               "녹음 전문과 API 키는 DB에 저장하지 않습니다.")
+    st.info(st.session_state.get("identity_storage_status", "저장소 상태 확인 중"))
+    if st.button("☁️ 현재 설정·인물 목록 DB에 저장 / 재시도", key="identity_force_save"):
+        save_identity_state()
+        st.rerun()
+    st.caption("현재 프로필은 팀 공용입니다. 여러 사용자가 접속하면 동일한 인물 목록을 공유합니다. "
+               "개인별 분리는 로그인 인증 기능이 필요합니다.")
 
     tab_people, tab_pending, tab_result = st.tabs(
         ["인물 관리", "🆕 신규 인물 승인", "최근 식별 결과"]
@@ -469,6 +683,7 @@ def render_identity_settings():
                         "extra_aliases": [x.strip() for x in alias_text.split(",") if x.strip()],
                     }})
                     st.session_state.identity_people = {**people, **entry}
+                    save_identity_state()
                     st.rerun()
                 except ValueError as exc:
                     st.error(str(exc))
@@ -492,12 +707,14 @@ def render_identity_settings():
                             "extra_aliases": [x.strip() for x in new_aliases.split(",") if x.strip()],
                         }})
                         st.session_state.identity_people = {**people, **validated}
+                        save_identity_state()
                         st.rerun()
                     except ValueError as exc:
                         st.error(str(exc))
                 confirm = st.checkbox("삭제를 확인했습니다", key="identity_delete_confirm")
                 if st.button("선택 인물 삭제", disabled=not confirm, key="identity_delete"):
                     st.session_state.identity_people = {k: v for k, v in people.items() if k != selected}
+                    save_identity_state()
                     st.rerun()
 
         with st.expander("📁 팀원과 인물 목록 공유"):
@@ -510,10 +727,11 @@ def render_identity_settings():
                         raise ValueError("JSON 파일은 100KB 이하여야 합니다.")
                     loaded = json.loads(uploaded.getvalue().decode("utf-8-sig"))
                     st.session_state.identity_people = validate_people(loaded)
+                    save_identity_state()
                     st.rerun()
                 except (UnicodeError, ValueError, TypeError) as exc:
                     st.error(f"불러오기 실패: {exc}")
-            st.caption("인물 정보는 현재 접속 세션에만 저장됩니다. 팀원끼리는 JSON으로 공유하세요.")
+            st.caption("Supabase 연결 시 수정 사항은 자동으로 DB에 저장됩니다. JSON은 별도 백업용입니다.")
 
     with tab_pending:
         render_new_people_review()
@@ -555,6 +773,10 @@ def register_settings_section(title, render_func):
     SETTINGS_SECTIONS[title] = render_func
 
 
+def _sync_settings_menu_selection():
+    st.session_state["app_settings_section"] = st.session_state["_app_settings_menu_widget"]
+
+
 def render_settings_menu():
     """설정창 왼쪽 메뉴와 오른쪽 내용을 출력."""
     default_page = "🏠 설정 홈"
@@ -563,13 +785,16 @@ def render_settings_menu():
 
     menu_col, content_col = st.columns([1, 2.8], gap="medium")
     with menu_col:
-        selected_page = st.radio(
+        # 왼쪽 메뉴는 표시 전용으로 두고 선택 페이지는 별도로 유지.
+        st.session_state["_app_settings_menu_widget"] = st.session_state["app_settings_section"]
+        st.radio(
             "설정 메뉴",
             options=list(SETTINGS_SECTIONS),
-            key="app_settings_section",
+            key="_app_settings_menu_widget",
+            on_change=_sync_settings_menu_selection,
         )
     with content_col:
-        SETTINGS_SECTIONS[selected_page]()
+        SETTINGS_SECTIONS[st.session_state["app_settings_section"]]()
 
 
 @st.dialog("⚙️ 설정", width="large")
