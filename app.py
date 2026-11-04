@@ -1,4 +1,3 @@
-
 import os
 import io
 import html
@@ -7,7 +6,7 @@ import hashlib
 import streamlit as st
 from openai import OpenAI
 from streamlit_mic_recorder import mic_recorder
-from identity_settings_addon import show_identity_settings_dialog
+from identity_settings_addon import show_settings_dialog
 
 
 # ==========================================
@@ -262,7 +261,7 @@ with settings_col:
         key="settings_button",
         help="설정"
     ):
-        show_identity_settings_dialog()
+        show_settings_dialog()
 
 
 # ==========================================

@@ -325,3 +325,55 @@ def render_identity_settings():
 def show_identity_settings_dialog():
     """현재 화면의 오른쪽 위 설정 버튼용 팝업."""
     render_identity_settings()
+
+
+# --- SETTINGS_ROUTER_EXTENSION_V1 ---
+
+# 설정 홈
+def render_settings_home():
+    st.subheader("설정 홈")
+    st.info("왼쪽 메뉴에서 설정할 항목을 선택하세요.")
+
+
+# 설정 메뉴 등록
+SETTINGS_SECTIONS = {
+    "🏠 설정 홈": render_settings_home,
+    "👥 인물 식별 설정": render_identity_settings,
+}
+
+
+# 추후 다른 설정 메뉴 추가용 함수
+def register_settings_section(title, render_function):
+
+    if not isinstance(title, str) or not callable(render_function):
+        raise ValueError("설정 이름과 함수를 확인하세요.")
+
+    SETTINGS_SECTIONS[title] = render_function
+
+
+# 설정 메뉴 UI
+def render_settings_menu():
+
+    menu_col, content_col = st.columns(
+        [1, 2.5],
+        gap="medium"
+    )
+
+    with menu_col:
+
+        selected = st.radio(
+            "설정 메뉴",
+            options=list(SETTINGS_SECTIONS.keys()),
+            key="app_settings_section"
+        )
+
+    with content_col:
+
+        SETTINGS_SECTIONS[selected]()
+
+
+# 오른쪽 위 설정 버튼에서 여는 팝업
+@st.dialog("⚙️ 설정", width="large")
+def show_settings_dialog():
+
+    render_settings_menu()
