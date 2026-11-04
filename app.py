@@ -7,6 +7,7 @@ import hashlib
 import streamlit as st
 from openai import OpenAI
 from streamlit_mic_recorder import mic_recorder
+from identity_settings_addon import show_identity_settings_dialog
 
 
 # ==========================================
@@ -261,7 +262,7 @@ with settings_col:
         key="settings_button",
         help="설정"
     ):
-        st.toast("설정 기능은 추후 추가할 예정입니다.")
+        show_identity_settings_dialog()
 
 
 # ==========================================
