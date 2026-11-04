@@ -182,6 +182,15 @@ def process_question(question, reference_text=""):
         st.error(f"AI 처리 중 오류: {e}")
 
 
+
+# ==================================================
+# 추가 기능: 인물 식별
+# ==================================================
+from identity_extension import install_person_identity
+
+ask_ai = install_person_identity(ask_ai)
+
+
 # ==========================================
 # 5. 사이드바
 # ==========================================
