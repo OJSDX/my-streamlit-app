@@ -6,6 +6,7 @@ import copy
 import json
 import re
 import os
+import base64
 import urllib.request
 import urllib.parse
 import urllib.error
@@ -33,10 +34,10 @@ RIGHT = r"(?=(?:께서는|께서|에게|한테|으로|로|은|는|이|가|을|�
 
 
 # ================================================================
-# 영구 저장소(Supabase PostgreSQL / REST API)
-# - Secret Key는 Streamlit Cloud 서버의 Secrets에서만 읽는다.
-# - 사용자 인증이 없는 현재 앱은 지정된 PROFILE_ID 하나를 팀에서 공유한다.
-# - 설정 / 승인된 인물 / 승인 대기 후보만 저장한다. 녹음 전문은 저장하지 않는다.
+# 개인용 GitHub 비공개 저장소 영구 저장 (별도 DB 불필요)
+# GitHub API: GET/PUT /repos/{owner}/{repo}/contents/{path}
+# 설정과 승인된 인물, 승인 대기 후보만 저장. 전체 음성/대화는 저장하지 않음.
+# 토큰은 반드시 Streamlit Secrets에 저장. 앱 저장소에는 넣지 않음.
 # ================================================================
 PERSISTED_SETTINGS = (
     "identity_enabled", "identity_context_enabled",
@@ -44,138 +45,180 @@ PERSISTED_SETTINGS = (
 )
 
 
-def _identity_db_config():
-    def config_value(name):
-        value = os.environ.get(name)
-        if value:
-            return value
-        try:
-            return st.secrets.get(name, "")
-        except (FileNotFoundError, KeyError):
-            return ""
-
-    url = str(config_value("SUPABASE_URL")).strip().rstrip("/")
-    key = str(config_value("SUPABASE_SECRET_KEY") or config_value("SUPABASE_SERVICE_ROLE_KEY")).strip()
-    profile = str(config_value("IDENTITY_PROFILE_ID") or "thumbsup-team").strip()
-    if not url or not key:
-        return None
-    if not url.startswith("https://") or not profile or len(profile) > 100:
-        raise ValueError("Supabase URL 또는 프로필 ID 설정을 확인하세요.")
-    return url, key, profile
-
-
-def _identity_db_request(method, *, payload=None):
-    config = _identity_db_config()
-    if not config:
-        raise RuntimeError("Supabase Secrets 미설정")
-    url, key, profile = config
-    route = url + "/rest/v1/identity_app_state"
-    if method == "GET":
-        route += "?profile_id=eq." + urllib.parse.quote(profile, safe="") + "&select=state"
-    elif method == "POST":
-        route += "?on_conflict=profile_id"
-    headers = {
-        "apikey": key,
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-    }
-    # 기존 JWT형 service_role 키를 사용하는 프로젝트를 위한 호환 처리.
-    if key.startswith("eyJ"):
-        headers["Authorization"] = "Bearer " + key
-    if method == "POST":
-        headers["Prefer"] = "resolution=merge-duplicates,return=minimal"
-    data = None if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    req = urllib.request.Request(route, data=data, headers=headers, method=method)
+def _secret_value(name):
+    value = os.getenv(name)
+    if value:
+        return value
     try:
-        with urllib.request.urlopen(req, timeout=8) as res:
-            body = res.read(250_000)
-            return json.loads(body) if body else None
+        return str(st.secrets.get(name, ""))
+    except (FileNotFoundError, KeyError):
+        return ""
+
+
+def _storage_config():
+    repository = _secret_value("IDENTITY_DATA_REPO").strip()
+    token = _secret_value("IDENTITY_GITHUB_TOKEN").strip()
+    path = _secret_value("IDENTITY_DATA_FILE").strip() or "identity_state.json"
+    if not (repository and token):
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
+        raise ValueError("IDENTITY_DATA_REPO는 owner/repo 형식이어야 합니다.")
+    if path.startswith("/") or ".." in path.split("/") or len(path)>160:
+        raise ValueError("IDENTITY_DATA_FILE 경로를 확인하세요.")
+    return repository, token, path
+
+
+def _github_content_request(method, payload=None):
+    """GitHub Content API. token/응답 본문은 화면에 노출하지 않는다."""
+    repository, token, path = _storage_config()
+    encoded_path = urllib.parse.quote(path, safe="/")
+    url = f"https://api.github.com/repos/{repository}/contents/{encoded_path}"
+    headers = {
+        "Authorization": "Bearer " + token,
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "ThumbsUp-AI-Personal-Identity-Storage",
+    }
+    data = None
+    if payload is not None:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            content = response.read(500_000)
+            return json.loads(content.decode("utf-8")) if content else None
     except urllib.error.HTTPError as exc:
-        # 인증 정보나 응답 본문을 사용자 화면에 출력하지 않는다.
-        raise RuntimeError(f"Supabase HTTP {exc.code} (테이블·Secrets·접근 권한 확인)") from None
+        if exc.code == 404 and method == "GET":
+            # 파일 없음과 권한 없는 비공개 저장소를 구분하려면 별도 저장소 접근 확인 필요
+            raise FileNotFoundError("저장 파일 또는 비공개 저장소를 찾지 못했습니다. 저장소명·토큰 권한을 확인하세요.") from None
+        if exc.code in (409, 422):
+            raise RuntimeError("GitHub 저장 버전 충돌: 다른 기기에서 변경했을 수 있습니다. 새로 접속 후 다시 시도하세요.") from None
+        raise RuntimeError(f"GitHub API HTTP {exc.code}: 저장소명·권한·토큰을 확인하세요.") from None
     except (urllib.error.URLError, TimeoutError) as exc:
-        raise RuntimeError(f"Supabase 연결 실패: {type(exc).__name__}") from None
+        raise RuntimeError(f"GitHub 접속 오류: {type(exc).__name__}") from None
 
 
-def _sanitize_pending(data):
+def _clean_pending(data):
     if not isinstance(data, list):
         return []
-    clean = []
-    for candidate in data[:30]:
-        if not isinstance(candidate, dict):
+    out = []
+    for p in data[:30]:
+        if not isinstance(p, dict):
             continue
-        name, title, evidence = (candidate.get(k, "") for k in ("name", "title", "evidence"))
-        aliases = candidate.get("extra_aliases", [])
-        if not (isinstance(name, str) and 2 <= len(name.strip()) <= 60
+        name, title, evidence = (p.get(k, "") for k in ("name", "title", "evidence"))
+        aliases = p.get("extra_aliases", [])
+        if (isinstance(name, str) and 2 <= len(name.strip()) <= 60
                 and isinstance(title, str) and len(title) <= 40
                 and isinstance(evidence, str) and len(evidence) <= 180
                 and isinstance(aliases, list)):
-            continue
-        clean.append({
-            "name": name.strip(), "title": title.strip(),
-            "evidence": evidence, "extra_aliases": [a.strip() for a in aliases[:30]
-                if isinstance(a, str) and 0 < len(a.strip()) <= 60]
-        })
-    return clean
+            out.append({"name": name.strip(), "title": title.strip(), "evidence": evidence,
+                        "extra_aliases": [a.strip() for a in aliases[:30]
+                            if isinstance(a, str) and 0 < len(a.strip()) <= 60]})
+    return out
+
+
+def _storage_message():
+    return st.session_state.get("identity_storage_status", "영구 저장 미확인")
 
 
 def save_identity_state():
-    """사용자가 변경한 설정을 DB에 upsert. 실패해도 대화 기능은 유지한다."""
-    if not _identity_db_config():
-        st.session_state.identity_storage_status = "⚠️ 영구 저장 미연결: 현재 세션에만 저장됩니다."
-        return False
+    """GitHub private repo 저장. 실패하면 명확히 상태를 남기며 앱 자체는 계속 실행."""
     try:
+        cfg = _storage_config()
+        if not cfg:
+            st.session_state.identity_storage_status = "⚠️ 영구 저장 미연결: 현재 접속에서만 유지됩니다."
+            return False
+        # 로드 실패 상태에서 저장하면 기존 파일을 덮어쓸 위험이 있다.
+        if st.session_state.get("identity_storage_blocked", False):
+            st.session_state.identity_storage_status = (
+                "❌ 저장 차단: 기존 자료를 불러오지 못했습니다. Secrets 및 저장소 권한을 확인하세요."
+            )
+            return False
+        people = validate_people(st.session_state.identity_people)
         state = {
+            "schema_version": 1,
             "settings": {key: bool(st.session_state.get(key, False)) for key in PERSISTED_SETTINGS},
-            "people": validate_people(st.session_state.identity_people),
-            "pending": _sanitize_pending(st.session_state.identity_pending),
+            "people": people,
+            "pending": _clean_pending(st.session_state.identity_pending),
         }
-        profile = _identity_db_config()[2]
-        _identity_db_request("POST", payload={"profile_id": profile, "state": state})
-        st.session_state.identity_storage_status = "✅ Supabase 저장 완료"
+        body = base64.b64encode(json.dumps(state, ensure_ascii=False, indent=2).encode("utf-8")).decode("ascii")
+        commit_payload = {"message": "Update personal identity settings", "content": body}
+        sha = st.session_state.get("identity_storage_sha")
+        if sha:
+            commit_payload["sha"] = sha
+        result = _github_content_request("PUT", commit_payload)
+        st.session_state.identity_storage_sha = result["content"]["sha"]
+        st.session_state.identity_storage_status = "✅ 비공개 GitHub 저장소에 저장됨"
         return True
     except Exception as exc:
-        st.session_state.identity_storage_status = f"❌ 영구 저장 실패: {type(exc).__name__}" + (
-            f" ({str(exc)})" if isinstance(exc, RuntimeError) else ""
-        )
+        st.session_state.identity_storage_status = f"❌ 저장 실패: {str(exc)[:180]}"
         return False
 
 
 def load_identity_state():
-    """세션 최초 시작 시 1회 불러오기; 중간 실패 시 기본값을 DB에 덮어쓰지 않는다."""
-    if not _identity_db_config():
-        st.session_state.identity_storage_status = "⚠️ Supabase 미설정: 현재 세션에만 유지됩니다."
-        return
+    """세션 시작 시 비공개 저장소에서 로드; 실패 시 덮어쓰기 방지."""
     try:
-        rows = _identity_db_request("GET")
-        if not rows:
-            st.session_state.identity_storage_status = "☁️ DB 연결됨 · 아직 저장된 설정 없음"
+        cfg = _storage_config()
+        if not cfg:
+            st.session_state.identity_storage_status = "⚠️ GitHub 영구 저장 미설정: 이 세션에서만 유지됩니다."
             return
-        if not isinstance(rows, list) or not isinstance(rows[0], dict):
-            raise ValueError("DB 응답 형식 오류")
-        state = rows[0].get("state")
+        repository, token, path = cfg
+        try:
+            result = _github_content_request("GET")
+        except FileNotFoundError:
+            # 404는 비공개 저장소 권한 문제일 수도 있으므로
+            # repo API로 접근 권한을 먼저 확인하고 존재할 때만 신규 파일로 처리.
+            _github_repo_permission_check(repository, token)
+            st.session_state.identity_storage_sha = None
+            st.session_state.identity_storage_status = "☁️ 저장소 연결됨 · 최초 저장 시 파일 생성"
+            return
+        if not isinstance(result, dict) or result.get("type") != "file":
+            raise ValueError("GitHub 데이터 파일 응답이 올바르지 않습니다.")
+        encoded = result.get("content", "").replace("\n", "")
+        payload = base64.b64decode(encoded, validate=True)
+        state = json.loads(payload.decode("utf-8"))
         if not isinstance(state, dict):
-            raise ValueError("DB 상태 데이터 형식 오류")
-        people = validate_people(state.get("people", {}))
-        pending = _sanitize_pending(state.get("pending", []))
+            raise ValueError("저장된 JSON 형식이 잘못되었습니다.")
+        people = validate_people(state["people"])
+        pending = _clean_pending(state.get("pending", []))
         settings = state.get("settings", {})
         if not isinstance(settings, dict):
-            raise ValueError("DB 설정 데이터 형식 오류")
+            raise ValueError("저장된 설정값 형식이 잘못되었습니다.")
         for key in PERSISTED_SETTINGS:
-            if key in settings:
-                if not isinstance(settings[key], bool):
-                    raise ValueError(f"{key}: boolean 형식 오류")
+            if key in settings and not isinstance(settings[key], bool):
+                raise ValueError(f"{key} 저장값은 참/거짓이어야 합니다.")
         st.session_state.identity_people = people
         st.session_state.identity_pending = pending
         for key in PERSISTED_SETTINGS:
             if key in settings:
                 st.session_state[key] = settings[key]
-        st.session_state.identity_storage_status = "✅ Supabase 설정 불러오기 완료"
+        st.session_state.identity_storage_sha = result["sha"]
+        st.session_state.identity_storage_status = "✅ 비공개 GitHub 저장소에서 불러옴"
     except Exception as exc:
-        st.session_state.identity_storage_status = (
-            f"❌ 영구 저장 불러오기 실패: {type(exc).__name__}" +
-            (f" ({str(exc)})" if isinstance(exc, RuntimeError) else "")
-        )
+        st.session_state.identity_storage_blocked = True
+        st.session_state.identity_storage_status = f"❌ 로드 실패 · 저장 차단: {str(exc)[:180]}"
+
+
+def _github_repo_permission_check(repository, token):
+    url = f"https://api.github.com/repos/{repository}"
+    request = urllib.request.Request(url, headers={
+        "Authorization": "Bearer " + token,
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "ThumbsUp-AI-Personal-Identity-Storage",
+    })
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            data = json.load(response)
+        if not data.get("private", False):
+            raise RuntimeError("데이터 저장소가 공개(Public) 상태입니다. 반드시 Private으로 변경하세요.")
+        if not data.get("permissions", {}).get("push", False):
+            raise RuntimeError("저장소 쓰기 권한이 없습니다. 토큰에 Contents: Read and write를 부여하세요.")
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"저장소 확인 실패 HTTP {exc.code}: 토큰과 저장소 경로를 확인하세요.") from None
+    except (urllib.error.URLError, TimeoutError) as exc:
+        raise RuntimeError(f"저장소 확인 중 연결 오류: {type(exc).__name__}") from None
 
 
 def init_identity():
@@ -193,9 +236,8 @@ def init_identity():
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
-    if not st.session_state.get("_identity_db_loaded", False):
-        # 실패해도 매 리런마다 DB로 기본값을 덮어쓰지 않는다.
-        st.session_state["_identity_db_loaded"] = True
+    if not st.session_state.get("_identity_storage_loaded", False):
+        st.session_state["_identity_storage_loaded"] = True
         load_identity_state()
 
 
@@ -631,6 +673,18 @@ def render_identity_settings():
     """설정 내용만 렌더링: 미래의 UI 설정 페이지에서도 재사용 가능."""
     init_identity()
     st.subheader("👥 인물 식별 설정")
+    status = _storage_message()
+    if status.startswith("✅"):
+        st.success(status)
+    elif status.startswith("❌"):
+        st.error(status)
+    else:
+        st.warning(status)
+    if st.button("☁️ 현재 설정을 다시 저장", key="identity_save_now"):
+        if save_identity_state():
+            st.success("저장 완료")
+        else:
+            st.error(_storage_message())
     _persistent_identity_checkbox("인물 구분 기능 사용", "identity_enabled")
     _persistent_identity_checkbox(
         "LLM 문맥 기반 식별 사용", "identity_context_enabled",
@@ -644,14 +698,8 @@ def render_identity_settings():
     )
     st.caption("새 사람을 자동 저장하지 않습니다. 이름이 명확히 언급된 경우 후보로 올리고 승인 후 등록합니다. "
                "음성에서 화자의 목소리를 판별하는 기능은 아닙니다.")
-    st.caption("설정값·등록 인물·승인 대기 후보는 Supabase 연결 시 영구 저장됩니다. "
-               "녹음 전문과 API 키는 DB에 저장하지 않습니다.")
-    st.info(st.session_state.get("identity_storage_status", "저장소 상태 확인 중"))
-    if st.button("☁️ 현재 설정·인물 목록 DB에 저장 / 재시도", key="identity_force_save"):
-        save_identity_state()
-        st.rerun()
-    st.caption("현재 프로필은 팀 공용입니다. 여러 사용자가 접속하면 동일한 인물 목록을 공유합니다. "
-               "개인별 분리는 로그인 인증 기능이 필요합니다.")
+    st.caption("비공개 GitHub 저장소에 연결되면 다른 기기에서도 같은 설정과 인물 목록을 불러옵니다. "
+               "저장 실패 상태에서는 이 세션에서만 변경됩니다.")
 
     tab_people, tab_pending, tab_result = st.tabs(
         ["인물 관리", "🆕 신규 인물 승인", "최근 식별 결과"]
@@ -717,7 +765,7 @@ def render_identity_settings():
                     save_identity_state()
                     st.rerun()
 
-        with st.expander("📁 팀원과 인물 목록 공유"):
+        with st.expander("📁 인물 목록 JSON 백업·복원"):
             st.download_button("JSON 다운로드", data=json.dumps(people, ensure_ascii=False, indent=2),
                                file_name="people.json", mime="application/json", key="identity_export")
             uploaded = st.file_uploader("JSON 업로드", type=["json"], key="identity_import")
@@ -731,7 +779,7 @@ def render_identity_settings():
                     st.rerun()
                 except (UnicodeError, ValueError, TypeError) as exc:
                     st.error(f"불러오기 실패: {exc}")
-            st.caption("Supabase 연결 시 수정 사항은 자동으로 DB에 저장됩니다. JSON은 별도 백업용입니다.")
+            st.caption("개인용 JSON 백업입니다. 비공개 GitHub 저장소에도 자동 저장되며, 저장 상태를 확인하세요.")
 
     with tab_pending:
         render_new_people_review()

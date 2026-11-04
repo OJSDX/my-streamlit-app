@@ -27,6 +27,39 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
+# ==================================================
+# 개인용 접근 잠금: 외부 이용자의 데이터 변경/음성 API 사용 방지
+# APP_PASSWORD는 Streamlit Cloud Secrets에만 저장.
+# 새 브라우저 세션에서는 비밀번호를 다시 입력해야 하지만
+# 설정과 인물 목록은 별도 비공개 저장소에서 복원됨.
+# ==================================================
+import hmac
+
+def _secret_password():
+    try:
+        return str(st.secrets.get("APP_PASSWORD", ""))
+    except (FileNotFoundError, KeyError):
+        return ""
+
+_app_password = _secret_password()
+if not _app_password:
+    st.error("APP_PASSWORD가 설정되지 않았습니다. Streamlit Cloud Secrets에서 지정해 주세요.")
+    st.stop()
+
+if not st.session_state.get("_app_authenticated", False):
+    st.title("🔒 개인용 ThumbsUp AI")
+    with st.form("private_login"):
+        submitted_password = st.text_input("앱 접속 비밀번호", type="password")
+        login = st.form_submit_button("로그인")
+    if login:
+        if hmac.compare_digest(submitted_password, _app_password):
+            st.session_state["_app_authenticated"] = True
+            st.rerun()
+        else:
+            st.error("비밀번호가 올바르지 않습니다.")
+    st.stop()
+
+
 
 # ==========================================
 # 2. CSS 디자인
