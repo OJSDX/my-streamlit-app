@@ -1,3 +1,4 @@
+# 인물 식별 및 설정 메뉴 기능
 """ThumpsUp AI에 인물 호칭 정규화 + 문맥 식별 + 설정창을 추가하는 독립 모듈.
 기존 app.py의 process_audio() 함수나 UI 코드를 직접 정의/덮어쓰지 않는다.
 """
@@ -321,46 +322,50 @@ def render_identity_settings():
             st.write("검토 필요:", last["unresolved"] or "없음")
 
 
-@st.dialog("⚙️ 설정", width="large")
-def show_identity_settings_dialog():
-    """현재 화면의 오른쪽 위 설정 버튼용 팝업."""
-    render_identity_settings()
-
-
-# ==========================================
-# 전체 설정 메뉴
-# ==========================================
+# ======================================================
+# ⚙️ 설정 → 👥 인물 식별 설정
+# 설정 메뉴와 인물 관리 화면을 분리하여 향후 메뉴 추가 가능
+# ======================================================
 
 def render_settings_home():
-    st.subheader("⚙️ 설정")
-    st.info("왼쪽에서 설정 항목을 선택하세요.")
+    st.subheader("⚙️ 설정 홈")
+    st.info("왼쪽 메뉴에서 설정할 항목을 선택하세요.")
 
 
+# 메뉴 이름: 렌더링 함수
 SETTINGS_SECTIONS = {
     "🏠 설정 홈": render_settings_home,
     "👥 인물 식별 설정": render_identity_settings,
 }
 
 
-def register_settings_section(title, render_function):
-    SETTINGS_SECTIONS[title] = render_function
+def register_settings_section(title, render_func):
+    """추후 팀원이 다른 설정 화면을 등록할 때 사용할 함수."""
+    if not isinstance(title, str) or not title.strip():
+        raise ValueError("메뉴 이름을 입력하세요.")
+    if not callable(render_func):
+        raise TypeError("화면 렌더링 함수가 필요합니다.")
+    SETTINGS_SECTIONS[title] = render_func
 
 
 def render_settings_menu():
+    """설정창 왼쪽 메뉴와 오른쪽 내용을 출력."""
+    default_page = "🏠 설정 홈"
+    if st.session_state.get("app_settings_section") not in SETTINGS_SECTIONS:
+        st.session_state["app_settings_section"] = default_page
 
-    menu_col, content_col = st.columns([1, 2.5])
-
+    menu_col, content_col = st.columns([1, 2.8], gap="medium")
     with menu_col:
-        selected = st.radio(
+        selected_page = st.radio(
             "설정 메뉴",
-            list(SETTINGS_SECTIONS),
-            key="app_settings_section"
+            options=list(SETTINGS_SECTIONS),
+            key="app_settings_section",
         )
-
     with content_col:
-        SETTINGS_SECTIONS[selected]()
+        SETTINGS_SECTIONS[selected_page]()
 
 
 @st.dialog("⚙️ 설정", width="large")
 def show_settings_dialog():
+    """app.py의 우측 상단 설정(⚙️) 버튼에서 실행."""
     render_settings_menu()
