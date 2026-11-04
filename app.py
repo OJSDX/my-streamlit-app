@@ -12,6 +12,7 @@ from streamlit_mic_recorder import mic_recorder
 from identity_settings_addon import (
     init_identity,
     apply_identity,
+    propose_new_people,
     show_settings_dialog
 )
 
@@ -249,6 +250,13 @@ def process_audio(audio_bytes, reference_text=""):
                     f"인물 식별 중 오류가 발생했습니다: {e}"
                 )
                 question = original_question
+
+        # ----------------------------------
+        # 신규 인물 자동 추출 (승인 전 저장하지 않음)
+        # ----------------------------------
+        # STT 원문에서 새로운 사람을 찾습니다. 추출 API 장애는
+        # 기존 음성 비서 기능에 영향을 주지 않도록 모듈 안에서 처리됩니다.
+        propose_new_people(client, original_question)
 
         # ----------------------------------
         # AI 메시지 구성
@@ -583,6 +591,15 @@ if st.session_state.transcript:
             st.session_state.transcript
         )
 
+
+# ==========================================
+# 신규 인물 후보 안내
+# ==========================================
+if st.session_state.get("identity_pending"):
+    st.info(
+        f"🆕 신규 인물 후보 {len(st.session_state.identity_pending)}명 발견! "
+        "오른쪽 위 ⚙️ 설정 → 👥 인물 식별 설정 → 신규 인물 승인에서 확인하세요."
+    )
 
 # ==========================================
 # 11. 최근 인물 식별 결과
