@@ -9,7 +9,7 @@ from operator import itemgetter
 
 # 벡터 저장소 경로, 컬렉션 이름 (Colab에서 만들 때와 같아야 함)
 CHROMA_DIR = "chroma_db"
-COLLECTION = "ai_ethics"
+COLLECTION = "eduverse_faq"
 
 # 문서 포맷팅 함수
 def format_docs(docs):
@@ -55,8 +55,8 @@ def get_chain():
 chain = get_chain()
 
 # 페이지 설정
-st.set_page_config(page_title="RAG 챗봇", page_icon="🏢")
-st.title("🏢 생성형 AI 윤리 가이드 챗봇")
+st.set_page_config(page_title="FAQ 챗봇", page_icon="💬")
+st.title("💬 EduVerse Academy FAQ 챗봇")
 
 # 세션 상태 초기화
 if "messages" not in st.session_state:
